@@ -1,0 +1,4 @@
+[bindings.kotlin]
+# Generates API-level-aware cleanup code for Android 12 (API 31) devices.
+android = true
+android_cleaner = true

@@ -44,6 +44,24 @@ pub fn summary_json(db_path: String, tz_offset: i64) -> String {
     }
 }
 
+/// [`summary_json`] with a fractional UTC offset in hours (e.g. 5.5 for India), so
+/// nights and days are labelled on the wearer's actual clock instead of a rounded
+/// one. Returns `{ "error": … }` for an offset outside ±14 h.
+#[uniffi::export]
+pub fn summary_json_hours(db_path: String, tz_offset_hours: f64) -> String {
+    if !tz_offset_hours.is_finite() || !(-14.0..=14.0).contains(&tz_offset_hours) {
+        return json!({ "error": format!("invalid UTC offset {tz_offset_hours} h") }).to_string();
+    }
+    match oura_summary::build_summary(
+        std::path::Path::new(&db_path),
+        tz_offset_hours,
+        &oura_summary::NoModelRunner,
+    ) {
+        Ok(v) => v.to_string(),
+        Err(e) => json!({ "error": e.to_string() }).to_string(),
+    }
+}
+
 /// Hourly heart-rate bars for the HR detail screen — one bar per local-clock
 /// hour, `{low, high, mean, count}`, plus the newest quality-gated
 /// reading as `latest`.
@@ -56,6 +74,19 @@ pub fn summary_json(db_path: String, tz_offset: i64) -> String {
 #[uniffi::export]
 pub fn hourly_hr_json(db_path: String, tz_offset: i64, days: u32) -> String {
     match oura_summary::hourly_hr::hourly_hr(std::path::Path::new(&db_path), tz_offset, days) {
+        Ok(v) => v.to_string(),
+        Err(e) => json!({ "error": e.to_string() }).to_string(),
+    }
+}
+
+/// [`hourly_hr_json`] with a fractional UTC offset in hours, matching
+/// [`summary_json_hours`]. Returns `{ "error": … }` for an offset outside ±14 h.
+#[uniffi::export]
+pub fn hourly_hr_json_hours(db_path: String, tz_offset_hours: f64, days: u32) -> String {
+    if !tz_offset_hours.is_finite() || !(-14.0..=14.0).contains(&tz_offset_hours) {
+        return json!({ "error": format!("invalid UTC offset {tz_offset_hours} h") }).to_string();
+    }
+    match oura_summary::hourly_hr::hourly_hr(std::path::Path::new(&db_path), tz_offset_hours, days) {
         Ok(v) => v.to_string(),
         Err(e) => json!({ "error": e.to_string() }).to_string(),
     }
@@ -316,16 +347,47 @@ pub struct PairReport {
     pub minted: bool,
 }
 
+/// Identity read by [`RingSession::device_info`] without authenticating. Hardware is
+/// optional because a missing hardware id must not hide an otherwise valid identity.
+#[derive(uniffi::Record)]
+pub struct DeviceInfoReport {
+    pub serial: String,
+    pub hardware_id: Option<String>,
+    pub firmware_version: String,
+    pub api_version: String,
+    pub bt_stack_version: String,
+}
+
+/// Result of [`RingSession::verify_key`]: the key authenticated against `serial`.
+/// The battery read needs auth, so a value here is extra proof the key works.
+#[derive(Debug, uniffi::Record)]
+pub struct VerifyReport {
+    pub serial: String,
+    pub battery_percent: Option<u8>,
+}
+
+/// One on-ring measurement feature as reported after [`RingSession::enable_measurements`].
+/// `mode` 0 = off, 1 = automatic, 2 = requested, 3 = live; `state` is the ring's raw
+/// run state.
+#[derive(Debug, uniffi::Record)]
+pub struct FeatureReport {
+    pub name: String,
+    pub mode: u8,
+    pub state: u8,
+    pub enabled: bool,
+}
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum SyncError {
     #[error("{0}")]
     Failed(String),
-    #[error("storage operation {operation}: {message} (sqlite={code}, extended={extended_code}, checkpoint={checkpoint})")]
+    #[error("storage operation {operation}: {detail} (sqlite={code}, extended={extended_code}, checkpoint={checkpoint})")]
     Storage {
         operation: String,
         code: i32,
         extended_code: i32,
-        message: String,
+        // Not `message`: Kotlin bindings would collide with `Throwable.message`.
+        detail: String,
         retryable: bool,
         checkpoint: u32,
     },
@@ -346,7 +408,7 @@ fn storage_failure(operation: &str, error: oura_store::error::Error, checkpoint:
         operation: operation.into(),
         code,
         extended_code,
-        message: error.to_string(),
+        detail: error.to_string(),
         retryable: code == 5 || code == 6,
         checkpoint,
     }
@@ -587,6 +649,54 @@ impl RingSession {
         }
     }
 
+    /// Read the ring's serial, hardware id and firmware versions over the connected
+    /// link. These requests need no auth key and write nothing to the ring, so this
+    /// works on a ring still paired with another app.
+    pub async fn device_info(&self) -> Result<DeviceInfoReport, SyncError> {
+        let mut stop = self.stop.subscribe();
+        if let Some(reason) = stop.borrow().clone() {
+            return Err(SyncError::Interrupted { reason });
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => Err(SyncError::Interrupted {
+                reason: stop.borrow().clone().unwrap_or_else(|| "cancelled".into()) }),
+            result = self.device_info_inner() => result,
+        }
+    }
+
+    /// Authenticate with `key_hex` and read the battery, without installing anything.
+    /// Confirms a stored key still unlocks the ring, and recovers an interrupted
+    /// pairing whose key reached the ring before the caller could record success.
+    pub async fn verify_key(&self, key_hex: String) -> Result<VerifyReport, SyncError> {
+        let mut stop = self.stop.subscribe();
+        if let Some(reason) = stop.borrow().clone() {
+            return Err(SyncError::Interrupted { reason });
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => Err(SyncError::Interrupted {
+                reason: stop.borrow().clone().unwrap_or_else(|| "cancelled".into()) }),
+            result = self.verify_key_inner(key_hex) => result,
+        }
+    }
+
+    /// Turn on daytime heart rate and SpO2 measurement, then report every measurement
+    /// feature's mode. A ring paired with a fresh key measures nothing until this runs:
+    /// the official app normally enables these features during its own onboarding.
+    pub async fn enable_measurements(&self, key_hex: String) -> Result<Vec<FeatureReport>, SyncError> {
+        let mut stop = self.stop.subscribe();
+        if let Some(reason) = stop.borrow().clone() {
+            return Err(SyncError::Interrupted { reason });
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => Err(SyncError::Interrupted {
+                reason: stop.borrow().clone().unwrap_or_else(|| "cancelled".into()) }),
+            result = self.enable_measurements_inner(key_hex) => result,
+        }
+    }
+
     /// **DESTRUCTIVE.** Wipe the ring back to factory state: the installed auth key,
     /// every BLE bond, the on-ring event buffer and the anthropometric profile are
     /// erased. Sync first — anything still only on the ring is lost.
@@ -622,6 +732,87 @@ impl RingSession {
     /// `oura-protocol` — upstream deliberately keeps it out of the shared protocol
     /// crate so nothing that merely links the decoder can emit it.
     const FACTORY_RESET_REQUEST: [u8; 2] = [0x1a, 0x00];
+
+    async fn device_info_inner(&self) -> Result<DeviceInfoReport, SyncError> {
+        let fail = SyncError::Failed;
+        let client = OuraClient::new(FfiTransport {
+            tx: self.tx.clone(),
+            writer: self.writer.clone(),
+        });
+        let serial = client
+            .serial()
+            .await
+            .map_err(|e| fail(format!("reading the ring serial: {e}")))?;
+        let firmware = client
+            .firmware()
+            .await
+            .map_err(|e| fail(format!("reading the ring firmware: {e}")))?;
+        let hardware_id = client.hardware_id().await.ok();
+        Ok(DeviceInfoReport {
+            serial,
+            hardware_id,
+            firmware_version: firmware.firmware_version,
+            api_version: firmware.api_version,
+            bt_stack_version: firmware.bt_stack_version,
+        })
+    }
+
+    async fn verify_key_inner(&self, key_hex: String) -> Result<VerifyReport, SyncError> {
+        let fail = SyncError::Failed;
+        let key = parse_key(&key_hex).ok_or_else(|| fail("auth key must be 32 hex chars".into()))?;
+        let client = OuraClient::new(FfiTransport {
+            tx: self.tx.clone(),
+            writer: self.writer.clone(),
+        });
+        let serial = client
+            .serial()
+            .await
+            .map_err(|e| fail(format!("reading the ring serial: {e}")))?;
+        client
+            .authenticate(&key)
+            .await
+            .map_err(|e| fail(format!("the saved key does not unlock ring {serial}: {e}")))?;
+        let battery_percent = client.battery().await.ok().map(|b| b.percent);
+        Ok(VerifyReport { serial, battery_percent })
+    }
+
+    async fn enable_measurements_inner(&self, key_hex: String) -> Result<Vec<FeatureReport>, SyncError> {
+        use oura_protocol::protocol::{feature, feature_mode};
+        let fail = SyncError::Failed;
+        let key = parse_key(&key_hex).ok_or_else(|| fail("auth key must be 32 hex chars".into()))?;
+        let client = OuraClient::new(FfiTransport {
+            tx: self.tx.clone(),
+            writer: self.writer.clone(),
+        });
+        client
+            .authenticate(&key)
+            .await
+            .map_err(|e| fail(format!("authenticating: {e}")))?;
+        for (label, id) in [("daytime heart rate", feature::DAYTIME_HR), ("SpO2", feature::SPO2)] {
+            client
+                .set_feature_mode(id, feature_mode::AUTOMATIC)
+                .await
+                .map_err(|e| fail(format!("enabling {label}: {e}")))?;
+        }
+        let mut reports = Vec::new();
+        for (name, id) in [
+            ("Daytime heart rate", feature::DAYTIME_HR),
+            ("Exercise heart rate", feature::EXERCISE_HR),
+            ("SpO2", feature::SPO2),
+            ("Resting heart rate", feature::RESTING_HR),
+        ] {
+            // A feature this firmware lacks must not hide the ones that were enabled.
+            if let Ok(status) = client.feature_status(id).await {
+                reports.push(FeatureReport {
+                    name: name.into(),
+                    mode: status.mode,
+                    state: status.state,
+                    enabled: status.mode != feature_mode::OFF,
+                });
+            }
+        }
+        Ok(reports)
+    }
 
     async fn factory_reset_inner(
         &self,
@@ -920,6 +1111,115 @@ mod tests {
     struct SilentWriter;
     impl BleWriter for SilentWriter {
         fn write(&self, _: Vec<u8>) {}
+    }
+
+    /// Answers only the unauthenticated identity reads and records every request.
+    struct IdentityRing {
+        tx: broadcast::Sender<Vec<u8>>,
+        sent: Mutex<Vec<Vec<u8>>>,
+    }
+    impl BleWriter for IdentityRing {
+        fn write(&self, data: Vec<u8>) {
+            self.sent.lock().unwrap().push(data.clone());
+            let reply = |tag: u8, payload: &[u8]| {
+                let mut frame = vec![tag, payload.len() as u8];
+                frame.extend_from_slice(payload);
+                frame
+            };
+            let frame = match (data.first(), data.get(2)) {
+                (Some(0x08), _) => reply(
+                    0x09,
+                    &[1, 2, 3, 2, 12, 3, 0, 0, 1, 7, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+                ),
+                (Some(0x18), Some(0x08)) => reply(0x19, b"\0SERIAL123"),
+                (Some(0x18), Some(0x18)) => reply(0x19, b"\0ORE_06"),
+                _ => return,
+            };
+            let _ = self.tx.send(frame);
+        }
+    }
+
+    #[tokio::test]
+    async fn device_info_reads_identity_without_writing_to_the_ring() {
+        let (tx, mut replies) = broadcast::channel(16);
+        let ring = Arc::new(IdentityRing { tx, sent: Mutex::new(Vec::new()) });
+        struct Shared(Arc<IdentityRing>);
+        impl BleWriter for Shared {
+            fn write(&self, data: Vec<u8>) {
+                self.0.write(data)
+            }
+        }
+        let session = RingSession::new(Box::new(Shared(ring.clone())));
+        let pump_session = session.clone();
+        let pump = tokio::spawn(async move {
+            while let Ok(frame) = replies.recv().await {
+                pump_session.push_frame(frame);
+            }
+        });
+
+        let info = session.device_info().await.unwrap();
+        pump.abort();
+
+        assert_eq!(info.serial, "SERIAL123");
+        assert_eq!(info.hardware_id.as_deref(), Some("ORE_06"));
+        assert_eq!(info.firmware_version, "2.12.3");
+        assert_eq!(info.api_version, "1.2.3");
+        assert_eq!(info.bt_stack_version, "7.0.0");
+        let sent = ring.sent.lock().unwrap();
+        assert!(sent.iter().all(|r| matches!(r.first(), Some(0x08 | 0x18))), "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn verify_key_rejects_malformed_keys_before_touching_the_ring() {
+        let (tx, _) = broadcast::channel(16);
+        let ring = Arc::new(IdentityRing { tx, sent: Mutex::new(Vec::new()) });
+        struct Shared(Arc<IdentityRing>);
+        impl BleWriter for Shared {
+            fn write(&self, data: Vec<u8>) {
+                self.0.write(data)
+            }
+        }
+        let session = RingSession::new(Box::new(Shared(ring.clone())));
+
+        let result = session.verify_key("not-a-key".into()).await;
+
+        assert!(matches!(result, Err(SyncError::Failed(ref m)) if m.contains("32 hex")), "{result:?}");
+        assert!(ring.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn enable_measurements_rejects_malformed_keys_before_touching_the_ring() {
+        let (tx, _) = broadcast::channel(16);
+        let ring = Arc::new(IdentityRing { tx, sent: Mutex::new(Vec::new()) });
+        struct Shared(Arc<IdentityRing>);
+        impl BleWriter for Shared {
+            fn write(&self, data: Vec<u8>) {
+                self.0.write(data)
+            }
+        }
+        let session = RingSession::new(Box::new(Shared(ring.clone())));
+
+        let result = session.enable_measurements("short".into()).await;
+
+        assert!(matches!(result, Err(SyncError::Failed(ref m)) if m.contains("32 hex")), "{result:?}");
+        assert!(ring.sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fractional_summary_rejects_impossible_offsets_and_reports_missing_databases() {
+        for bad in [f64::NAN, f64::INFINITY, 15.0, -14.5] {
+            let v: serde_json::Value = serde_json::from_str(&summary_json_hours("x.db".into(), bad)).unwrap();
+            assert!(v["error"].as_str().unwrap().contains("invalid UTC offset"), "{bad}: {v}");
+            let h: serde_json::Value =
+                serde_json::from_str(&hourly_hr_json_hours("x.db".into(), bad, 1)).unwrap();
+            assert!(h["error"].as_str().unwrap().contains("invalid UTC offset"), "{bad}: {h}");
+        }
+        let missing = std::env::temp_dir().join("oura-core-missing-summary.db");
+        let _ = std::fs::remove_file(&missing);
+        let v: serde_json::Value =
+            serde_json::from_str(&summary_json_hours(missing.display().to_string(), 5.5)).unwrap();
+        assert!(v.get("error").is_some() || v.get("device").is_some(), "{v}");
+        let _ = std::fs::remove_file(&missing);
     }
     struct IgnoreProgress;
     impl SyncProgressListener for IgnoreProgress {

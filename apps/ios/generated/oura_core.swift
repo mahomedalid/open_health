@@ -1037,7 +1037,7 @@ public enum SyncError {
     
     case Failed(String
     )
-    case Storage(operation: String, code: Int32, extendedCode: Int32, message: String, retryable: Bool, checkpoint: UInt32
+    case Storage(operation: String, code: Int32, extendedCode: Int32, detail: String, retryable: Bool, checkpoint: UInt32
     )
     case Interrupted(reason: String
     )
@@ -1064,7 +1064,7 @@ public struct FfiConverterTypeSyncError: FfiConverterRustBuffer {
             operation: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterInt32.read(from: &buf), 
             extendedCode: try FfiConverterInt32.read(from: &buf), 
-            message: try FfiConverterString.read(from: &buf), 
+            detail: try FfiConverterString.read(from: &buf), 
             retryable: try FfiConverterBool.read(from: &buf), 
             checkpoint: try FfiConverterUInt32.read(from: &buf)
             )
@@ -1088,12 +1088,12 @@ public struct FfiConverterTypeSyncError: FfiConverterRustBuffer {
             FfiConverterString.write(v1, into: &buf)
             
         
-        case let .Storage(operation,code,extendedCode,message,retryable,checkpoint):
+        case let .Storage(operation,code,extendedCode,detail,retryable,checkpoint):
             writeInt(&buf, Int32(2))
             FfiConverterString.write(operation, into: &buf)
             FfiConverterInt32.write(code, into: &buf)
             FfiConverterInt32.write(extendedCode, into: &buf)
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
             FfiConverterBool.write(retryable, into: &buf)
             FfiConverterUInt32.write(checkpoint, into: &buf)
             
